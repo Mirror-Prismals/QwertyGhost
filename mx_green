@@ -1,0 +1,433 @@
+// SingleKeyWithSwitch.cpp
+// Press 'A' to animate key press and play a click sound
+// Press Shift+A to toggle the keycap off, revealing a fully 3D mechanical switch:
+//   - Outer beveled box (like the keycap style)
+//   - (Inner beveled box removed)
+//   - A cloned cube (based on the outer box) rendered as a larger, full dark forest-green cube, animated with key press.
+// Only the cloned cube responds to the A press animation.
+
+#include <GLFW/glfw3.h>
+#include <glm/glm.hpp>
+#include <cstdlib>
+#include <fstream>
+#include <iostream>
+#include <string>
+#include <thread>
+
+// Include stb_easy_font header (ensure "stb_easy_font.h" is in your source folder)
+#include "stb_easy_font.h"
+
+// -------------------------
+// Constants & Global Settings
+// -------------------------
+constexpr int   SCREEN_WIDTH = 800;
+constexpr int   SCREEN_HEIGHT = 600;
+constexpr float KEY_WIDTH = 100.0f;
+constexpr float KEY_HEIGHT = 100.0f;
+constexpr float KEY_DEPTH = 20.0f;       // Depth for the 3D effect
+constexpr double PRESS_FEEDBACK_DURATION = 0.15; // seconds for press animation
+
+// -------------------------
+// Embedded ChucK Code (Simple Click)
+// -------------------------
+const char* embeddedChucKCode = R"(
+fun void clickSound() {
+    Noise n => HPF hpf => ADSR env => dac;
+    0.3 => n.gain;
+    3000 => hpf.freq;
+    0.5 => hpf.Q;
+    0.2::ms => dur attack;
+    1::ms => dur decay;
+    0 => float sustain;
+    1::ms => dur release;
+    env.set(attack, decay, sustain, release);
+
+    env.keyOn();
+    (attack + decay) => now;
+    env.keyOff();
+    release => now;
+}
+
+clickSound();
+)";
+
+const char* TEMP_CHUCK_FILENAME = "temp_chuck_single_key.ck";
+
+// -------------------------
+// Key Structure
+// -------------------------
+struct Key {
+    std::string label;
+    glm::vec2   pos;         // Top-left position
+    glm::vec2   size;
+    float       pressAnim = 0.0f;  // 0.0 (up) to 0.5 (fully pressed)
+    bool        isPressed = false;
+    bool        keycapRemoved = false; // If true, show the switch instead
+};
+
+Key g_key;
+double g_lastFrameTime = 0.0;
+
+// -------------------------
+// Write Embedded ChucK Code to a Temporary File
+// -------------------------
+void initChucK() {
+    std::ofstream out(TEMP_CHUCK_FILENAME);
+    if (!out) {
+        std::cerr << "Error: Could not create temporary ChucK file.\n";
+        return;
+    }
+    out << embeddedChucKCode;
+    out.close();
+}
+
+// -------------------------
+// Play Key Sound (Click)
+// -------------------------
+void playKeySound() {
+    std::string command = std::string("chuck ") + TEMP_CHUCK_FILENAME;
+    std::thread([command]() { system(command.c_str()); }).detach();
+}
+
+// ----------------------------------------------------------------------
+// Helper: Draw a beveled 3D box in immediate mode (draws all five faces)
+// ----------------------------------------------------------------------
+void drawBeveledBox3D(float x, float y, float w, float h,
+    float depth,
+    float baseR, float baseG, float baseB)
+{
+    float bevel = depth * 0.5f;
+
+    // FRONT face
+    glColor3f(baseR, baseG, baseB);
+    glBegin(GL_QUADS);
+    glVertex3f(x, y, 0);
+    glVertex3f(x + w, y, 0);
+    glVertex3f(x + w, y + h, 0);
+    glVertex3f(x, y + h, 0);
+    glEnd();
+
+    // TOP face
+    glColor3f(baseR + 0.07f, baseG + 0.07f, baseB + 0.07f);
+    glBegin(GL_QUADS);
+    glVertex3f(x, y, 0);
+    glVertex3f(x + w, y, 0);
+    glVertex3f(x + w - bevel, y - bevel, -depth);
+    glVertex3f(x - bevel, y - bevel, -depth);
+    glEnd();
+
+    // RIGHT face
+    glColor3f(baseR - 0.05f, baseG - 0.05f, baseB - 0.05f);
+    glBegin(GL_QUADS);
+    glVertex3f(x + w, y, 0);
+    glVertex3f(x + w, y + h, 0);
+    glVertex3f(x + w - bevel, y + h - bevel, -depth);
+    glVertex3f(x + w - bevel, y - bevel, -depth);
+    glEnd();
+
+    // BOTTOM face
+    glColor3f(baseR - 0.02f, baseG - 0.02f, baseB - 0.02f);
+    glBegin(GL_QUADS);
+    glVertex3f(x, y + h, 0);
+    glVertex3f(x + w, y + h, 0);
+    glVertex3f(x + w - bevel, y + h - bevel, -depth);
+    glVertex3f(x - bevel, y + h - bevel, -depth);
+    glEnd();
+
+    // LEFT face
+    glColor3f(baseR - 0.03f, baseG - 0.03f, baseB - 0.03f);
+    glBegin(GL_QUADS);
+    glVertex3f(x, y, 0);
+    glVertex3f(x, y + h, 0);
+    glVertex3f(x - bevel, y + h - bevel, -depth);
+    glVertex3f(x - bevel, y - bevel, -depth);
+    glEnd();
+}
+
+// ----------------------------------------------------------------------
+// Helper: Draw a cube with only three faces (front, top, and left)
+// ----------------------------------------------------------------------
+void drawThreeFacedCube(float x, float y, float w, float h,
+    float depth,
+    float baseR, float baseG, float baseB)
+{
+    // Draw the front face
+    glColor3f(baseR, baseG, baseB);
+    glBegin(GL_QUADS);
+    glVertex3f(x, y, 0);
+    glVertex3f(x + w, y, 0);
+    glVertex3f(x + w, y + h, 0);
+    glVertex3f(x, y + h, 0);
+    glEnd();
+
+    // Top face
+    float bevel = depth * 0.5f;
+    glColor3f(baseR + 0.07f, baseG + 0.07f, baseB + 0.07f);
+    glBegin(GL_QUADS);
+    glVertex3f(x, y, 0);
+    glVertex3f(x + w, y, 0);
+    glVertex3f(x + w - bevel, y - bevel, -depth);
+    glVertex3f(x - bevel, y - bevel, -depth);
+    glEnd();
+
+    // Left face
+    glColor3f(baseR - 0.03f, baseG - 0.03f, baseB - 0.03f);
+    glBegin(GL_QUADS);
+    glVertex3f(x, y, 0);
+    glVertex3f(x, y + h, 0);
+    glVertex3f(x - bevel, y + h - bevel, -depth);
+    glVertex3f(x - bevel, y - bevel, -depth);
+    glEnd();
+}
+
+// ----------------------------------------------------------------------
+// Draw the 3D keycap (used when the keycap is intact)
+// ----------------------------------------------------------------------
+void drawKeycap3D(const Key& key) {
+    float pressAnim = key.pressAnim;
+    float bx = key.pos.x;
+    float by = key.pos.y;
+    float bw = key.size.x;
+    float bh = key.size.y;
+
+    float shiftLeft = 10.0f * pressAnim;
+    float shiftUp = 10.0f * pressAnim; // new vertical shift
+    float pressOffsetZ = KEY_DEPTH * pressAnim;
+    float newDepth = KEY_DEPTH * (1.0f - 0.5f * pressAnim);
+
+    // Apply both horizontal and vertical shift
+    float x = bx - shiftLeft;
+    float y = by - shiftUp;
+
+    float baseR = 0.9f, baseG = 0.9f, baseB = 0.85f;
+
+    // FRONT face
+    glColor3f(baseR, baseG, baseB);
+    glBegin(GL_QUADS);
+    glVertex3f(x, y, -pressOffsetZ);
+    glVertex3f(x + bw, y, -pressOffsetZ);
+    glVertex3f(x + bw, y + bh, -pressOffsetZ);
+    glVertex3f(x, y + bh, -pressOffsetZ);
+    glEnd();
+
+    // TOP face
+    glColor3f(baseR + 0.07f, baseG + 0.07f, baseB + 0.07f);
+    glBegin(GL_QUADS);
+    glVertex3f(x, y, -pressOffsetZ);
+    glVertex3f(x + bw, y, -pressOffsetZ);
+    glVertex3f(x + bw - newDepth, y - newDepth, -(pressOffsetZ + newDepth));
+    glVertex3f(x - newDepth, y - newDepth, -(pressOffsetZ + newDepth));
+    glEnd();
+
+    // RIGHT face
+    glColor3f(baseR - 0.05f, baseG - 0.05f, baseB - 0.05f);
+    glBegin(GL_QUADS);
+    glVertex3f(x + bw, y, -pressOffsetZ);
+    glVertex3f(x + bw, y + bh, -pressOffsetZ);
+    glVertex3f(x + bw - newDepth, y + bh - newDepth, -(pressOffsetZ + newDepth));
+    glVertex3f(x + bw - newDepth, y - newDepth, -(pressOffsetZ + newDepth));
+    glEnd();
+
+    // BOTTOM face
+    glColor3f(baseR - 0.02f, baseG - 0.02f, baseB - 0.02f);
+    glBegin(GL_QUADS);
+    glVertex3f(x, y + bh, -pressOffsetZ);
+    glVertex3f(x + bw, y + bh, -pressOffsetZ);
+    glVertex3f(x + bw - newDepth, y + bh - newDepth, -(pressOffsetZ + newDepth));
+    glVertex3f(x - newDepth, y + bh - newDepth, -(pressOffsetZ + newDepth));
+    glEnd();
+
+    // LEFT face
+    glColor3f(baseR - 0.03f, baseG - 0.03f, baseB - 0.03f);
+    glBegin(GL_QUADS);
+    glVertex3f(x, y, -pressOffsetZ);
+    glVertex3f(x, y + bh, -pressOffsetZ);
+    glVertex3f(x - newDepth, y + bh - newDepth, -(pressOffsetZ + newDepth));
+    glVertex3f(x - newDepth, y - newDepth, -(pressOffsetZ + newDepth));
+    glEnd();
+}
+
+// ----------------------------------------------------------------------
+// Draw a mechanical switch with:
+//   1) Outer beveled box (static)
+//   2) (Inner beveled box removed)
+//   3) A cloned cube (based on the outer box) rendered as a larger, full dark forest-green cube, animated with key press
+// ----------------------------------------------------------------------
+void drawMechanicalSwitch3D(const Key& key) {
+    float pressAnim = key.pressAnim;
+    float shiftLeft = 10.0f * pressAnim;
+    float shiftUp = 10.0f * pressAnim;  // vertical shift for the clone
+    float pressOffsetZ = KEY_DEPTH * pressAnim;
+
+    // Outer box (static) - modified to use dark grey (#808080)
+    float bx = key.pos.x + key.size.x * 0.3f;
+    float by = key.pos.y + key.size.y * 0.3f;
+    float bw = key.size.x * 0.4f;
+    float bh = key.size.y * 0.4f;
+    float outerDepth = 16.0f;
+    float outerR = 0.5f, outerG = 0.5f, outerB = 0.5f;  // dark grey color
+    drawBeveledBox3D(bx, by, bw, bh, outerDepth, outerR, outerG, outerB);
+
+    // Use the outer box as the anchor.
+    float ix = bx;
+    float iy = by;
+    float iw = bw;
+    float ih = bh;
+    // Define a depth for the animated element based on the outer box.
+    float animDepth = outerDepth - 6.0f;
+
+    // Draw only the cloned cube (remove the tiny cube block)
+    {
+        float cloneScale = 0.7f * 0.8f; // 20% smaller than the original 0.7, so now 0.56
+        float cloneW = iw * cloneScale;
+        float cloneH = ih * cloneScale;
+        // Animate the clone's bevel depth like the keycap:
+        float cloneDepth = (animDepth * cloneScale * 1.5f) * (1.0f - 0.5f * pressAnim);
+        // Shift the cloned cube: previously it was offset by +5; now, move it back up/left by 3 (i.e. +2 overall)
+        float cloneX = ix + (iw - cloneW) / 2.0f + 2.0f;
+        float cloneY = iy + (ih - cloneH) / 2.0f + 2.0f;
+
+        glPushMatrix();
+        // Apply key press animation transform for the cloned cube.
+        // Here we use a reduced translation (half the shift) for horizontal and vertical compared to the keycap.
+        glTranslatef(-0.5f * shiftLeft, -0.5f * shiftUp, -pressOffsetZ);
+        // Adjust translation so the clone’s back face is near the anchor's back face
+        glTranslatef(0, 0, cloneDepth - animDepth);
+
+        // Force it to draw even if behind something, but keep top/left occlusion
+        glPushAttrib(GL_DEPTH_BUFFER_BIT);
+        glDepthFunc(GL_ALWAYS);
+
+        drawThreeFacedCube(cloneX, cloneY, cloneW, cloneH, cloneDepth, 0.1f, 0.4f, 0.1f);
+
+        glPopAttrib();
+        glPopMatrix();
+    }
+}
+
+// ----------------------------------------------------------------------
+// Update Key Animation
+// ----------------------------------------------------------------------
+void updateKeyAnimation(Key& key, float deltaTime) {
+    float animSpeed = 0.5f / static_cast<float>(PRESS_FEEDBACK_DURATION);
+    float target = key.isPressed ? 0.5f : 0.0f;
+
+    if (key.pressAnim < target) {
+        key.pressAnim += animSpeed * deltaTime;
+        if (key.pressAnim > target)
+            key.pressAnim = target;
+    }
+    else if (key.pressAnim > target) {
+        key.pressAnim -= animSpeed * deltaTime;
+        if (key.pressAnim < target)
+            key.pressAnim = target;
+    }
+}
+
+// ----------------------------------------------------------------------
+// Render Text
+// ----------------------------------------------------------------------
+void renderText(float x, float y, const char* text) {
+    char buffer[99999];
+    int num_quads = stb_easy_font_print(x, y, const_cast<char*>(text), nullptr, buffer, sizeof(buffer));
+
+    glDisable(GL_DEPTH_TEST);
+    glColor3f(0.0f, 0.0f, 0.0f);
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glVertexPointer(2, GL_FLOAT, 16, buffer);
+    glDrawArrays(GL_QUADS, 0, num_quads * 4);
+    glDisableClientState(GL_VERTEX_ARRAY);
+    glEnable(GL_DEPTH_TEST);
+}
+
+// ----------------------------------------------------------------------
+// GLFW Key Callback
+//   Press A to animate
+//   Press Shift+A to toggle keycap
+// ----------------------------------------------------------------------
+void keyCallback(GLFWwindow* window, int key, int scancode, int action, int mods) {
+    if (key == GLFW_KEY_A) {
+        if (action == GLFW_PRESS) {
+            if (mods & GLFW_MOD_SHIFT) {
+                g_key.keycapRemoved = !g_key.keycapRemoved;
+            }
+            else {
+                g_key.isPressed = true;
+                std::thread(playKeySound).detach();
+            }
+        }
+        else if (action == GLFW_RELEASE) {
+            g_key.isPressed = false;
+        }
+    }
+}
+
+// ----------------------------------------------------------------------
+// Main
+// ----------------------------------------------------------------------
+int main() {
+    if (!glfwInit()) {
+        std::cerr << "Error: Failed to initialize GLFW\n";
+        return -1;
+    }
+    GLFWwindow* window = glfwCreateWindow(SCREEN_WIDTH, SCREEN_HEIGHT, "Single Key + Switch Demo", nullptr, nullptr);
+    if (!window) {
+        std::cerr << "Error: Failed to create GLFW window\n";
+        glfwTerminate();
+        return -1;
+    }
+
+    glfwMakeContextCurrent(window);
+    glfwSetKeyCallback(window, keyCallback);
+
+    // Set up orthographic projection
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    glOrtho(0, SCREEN_WIDTH, SCREEN_HEIGHT, 0, -100, 100);
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+
+    // Initialize key
+    g_key.label = "A";
+    g_key.size = glm::vec2(KEY_WIDTH, KEY_HEIGHT);
+    g_key.pos = glm::vec2((SCREEN_WIDTH - KEY_WIDTH) * 0.5f, (SCREEN_HEIGHT - KEY_HEIGHT) * 0.5f);
+
+    // Write embedded ChucK code
+    initChucK();
+
+    double lastTime = glfwGetTime();
+    g_lastFrameTime = lastTime;
+
+    // Main loop
+    while (!glfwWindowShouldClose(window)) {
+        double currentTime = glfwGetTime();
+        float deltaTime = static_cast<float>(currentTime - g_lastFrameTime);
+        g_lastFrameTime = currentTime;
+
+        glClearColor(0.8f, 0.8f, 0.7f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glEnable(GL_DEPTH_TEST);
+
+        updateKeyAnimation(g_key, deltaTime);
+
+        if (g_key.keycapRemoved) {
+            drawMechanicalSwitch3D(g_key);
+        }
+        else {
+            drawKeycap3D(g_key);
+            // Render the text with the same translation as the keycap
+            float shiftLeft = 10.0f * g_key.pressAnim;
+            float shiftUp = 10.0f * g_key.pressAnim;
+            float labelX = g_key.pos.x + 30.0f - shiftLeft;
+            float labelY = g_key.pos.y + g_key.size.y * 0.5f - 8.0f - shiftUp;
+            renderText(labelX, labelY, g_key.label.c_str());
+        }
+
+        glfwSwapBuffers(window);
+        glfwPollEvents();
+    }
+
+    glfwDestroyWindow(window);
+    glfwTerminate();
+    return 0;
+}
